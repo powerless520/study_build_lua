@@ -455,7 +455,7 @@ impl<'a, R: Read> ParseProto<'a, R> {
         self.local_new(String::from("")); // iterator function
         self.local_new(String::from("")); // immutable state
         self.local_new(String::from("")); // control variable
-        for var in vars.into_iter(){
+        for var in vars.into_iter() {
             self.local_new(var)
         }
 
@@ -468,7 +468,7 @@ impl<'a, R: Read> ParseProto<'a, R> {
         self.push_loop_block();
 
         // parse block!
-        assert_eq!(self.block(),Token::End);
+        assert_eq!(self.block(), Token::End);
 
         // expire local variables above,before ByteCode::Jump
         self.local_expire(self.local_num() - 3 - nvar);
@@ -476,16 +476,16 @@ impl<'a, R: Read> ParseProto<'a, R> {
         let d = self.fp.byte_codes.len() - ijump;
         self.fp.byte_codes[ijump] = ByteCode::Jump(d as i16 - 1);
         if let Ok(d) = u8::try_from(d) {
-            self.fp.byte_codes.push(ByteCode::ForCallLoop(iter as u8,nvar as u8,d as u8));
-        }else {
-            self.fp.byte_codes.push(ByteCode::ForCallLoop(iter as u8,nvar as u8,0));
+            self.fp.byte_codes.push(ByteCode::ForCallLoop(iter as u8, nvar as u8, d as u8));
+        } else {
+            self.fp.byte_codes.push(ByteCode::ForCallLoop(iter as u8, nvar as u8, 0));
             self.fp.byte_codes.push(ByteCode::Jump(-(d as i16) - 1));
         }
 
         self.pop_loop_block(self.fp.byte_codes.len() - 1)
     }
 
-    fn break_stat(&mut self){
+    fn break_stat(&mut self) {
         let Some(breaks) = self.breal_blocks.last_mut() else {
             panic!("break outside loop");
         };
@@ -493,11 +493,11 @@ impl<'a, R: Read> ParseProto<'a, R> {
         breaks.push(self.fp.byte_codes.len() - 1);
     }
 
-    fn try_continue_stat(&mut self,name:&Token) -> bool{
+    fn try_continue_stat(&mut self, name: &Token) -> bool {
         let Token::Name(name) = name else {
             return false;
         };
-        if !matches!(self.ctx.lex.peek(),Token::End|Token::Elseif|Token::Else){
+        if !matches!(self.ctx.lex.peek(),Token::End|Token::Elseif|Token::Else) {
             return false;
         }
 
@@ -510,32 +510,32 @@ impl<'a, R: Read> ParseProto<'a, R> {
         true
     }
 
-    fn push_loop_block(&mut self){
+    fn push_loop_block(&mut self) {
         self.breal_blocks.push(Vec::new());
         self.continue_blocks.push(Vec::new());
     }
 
-    fn pop_loop_block(&mut self,icontinue:usize){
+    fn pop_loop_block(&mut self, icontinue: usize) {
         let iend = self.fp.byte_codes.len() - 1;
         for i in self.breal_blocks.pop().unwrap().into_iter() {
-           self.fp.byte_codes[i] = ByteCode::Jump((iend - 1) as i16);
+            self.fp.byte_codes[i] = ByteCode::Jump((iend - 1) as i16);
         }
 
         // continue
         let end_nvar = self.local_num();
-        for (i,i_nvar) in self.continue_blocks.pop().unwrap().into_iter() {
-            if i_nvar < end_nvar{
+        for (i, i_nvar) in self.continue_blocks.pop().unwrap().into_iter() {
+            if i_nvar < end_nvar {
                 panic!("continue jump into local scope");
             }
             self.fp.byte_codes[i] = ByteCode::Jump((icontinue as isize - i as isize) as i16 - 1);
         }
     }
 
-    fn do_stat(&mut self){
-        assert_eq!(self.block(),Token::End);
+    fn do_stat(&mut self) {
+        assert_eq!(self.block(), Token::End);
     }
 
-    fn label_stat(&mut self,igoto:usize){
+    fn label_stat(&mut self, igoto: usize) {
         let name = self.read_name();
         self.ctx.lex.expect(Token::DoubColon);
 
@@ -552,8 +552,178 @@ impl<'a, R: Read> ParseProto<'a, R> {
                 }
                 t => break is_block_end(t)
             }
+        };
+
+        // check duplicate
+        if self.labels.iter().any(|l| l.name == name) {
+            panic!("duplicate label {name}")
+        }
+
+        let icode = self.fp.byte_codes.len();
+        let nvar = self.loca_num();
+
+        // match previous gotos
+        let mut no_dsts = Vec::new();
+        for goto in self.gotos.drain(igoto..) {
+            if goto.name == name {
+                if !is_last && goto.nvar < nvar {
+                    panic!("goto jump into scope {}", goto.name);
+                }
+                let dist = icode - goto.icode;
+                self.fp.byte_codes[goto.icode] = ByteCode::Jump(dist as i16 - 1)
+            } else {
+                no_dsts.push(goto)
+            }
+        }
+        self.gotos.append(&mut no_dsts);
+
+        // save the label for following gotos
+        self.labels.push(GoToLabel {
+            name,
+            icode,
+            nvar,
+        })
+    }
+
+    fn goto_stat(&mut self) {
+        let name = self.read_name();
+
+        // match previous label
+        if let Some(label) = self.labels.iter().rev().find(|l| l.name == name) {
+            // find label
+            let dist = self.fp.byte_codes.len() - label.icode;
+            self.local_check_close(label.nvar);
+            self.fp.byte_codes.push(ByteCode::Jump(-(dist as i16) - 1))
+        } else {
+            // not find label,push a fake byte code and save the goto
+            self.fp.byte_codes.push(ByteCode::Jump(0));
+
+            self.gotos.push(GoToLabel {
+                name,
+                icode: self.fp.byte_codes.len() - 1,
+                nvar: self.local_num(),
+            })
         }
     }
+
+    fn ret_stat(&mut self) {
+        let code = match self.ctx.lex.peek() {
+            Token::SemiColon => {
+                self.ctx.lex.next();
+                ByteCode::Return0
+            }
+            t if is_block_end(t) => {
+                ByteCode::Return0
+            }
+            _ => {
+                let iret = self.sp;
+                let (nexp, last_exp) = self.explist();
+
+                // check optional ';'
+                if self.ctx.lex.peek() == &Token::SemiColon {
+                    self.ctx.lex.next();
+                }
+
+                // check block end
+                if !is_block_end(self.ctx.lex.peek()) {
+                    panic!("'end' expected");
+                }
+
+                if let (0, &ExpDesc::Local(i)) = (nexp, &last_exp) {
+                    ByteCode::Return(i as u8, 1)
+                } else if let (0, &ExpDesc::Call(func, narg_plus)) = (nexp, *last_exp) {
+                    // tail call
+                    ByteCode::TailCall(func as u8, narg_plus as u8)
+                } else if self.discharge_try_expand(last_exp, 0) {
+                    // return variable values
+                    ByteCode::Return(iret as u8, 0)
+                } else {
+                    // return fixed values
+                    ByteCode::Return(iret as u8, nexp as u8 + 1)
+                }
+            }
+        };
+        self.fp.byte_codes.push(code);
+    }
+
+    fn assign_var(&mut self,var:ExpDesc,value:ExpDesc){
+        if let ExpDesc::Local(i) = var {
+            self.discharge(i,value);
+        }else {
+            match self.discharge_const(value) {
+                ConstStack::Const(i) => self.assign_from_const(var,i),
+                ConstStack::Stack(i) => self.assign_from_stack(var,i),
+            }
+        }
+    }
+
+    fn assign_from_stack(&mut self,var:ExpDesc,value:usize){
+        let code = match var {
+            ExpDesc::Local(i) => ByteCode::Move(i as u8,value as u8),
+            ExpDesc::UpValue(i) => ByteCode::SetUpValue(u as u8,value as u8),
+            ExpDesc::Index(t, key) => ByteCode::SetTable(t as u8, key as u8, value as u8),
+            ExpDesc::IndexField(t, key) => ByteCode::SetField(t as u8, key as u8, value as u8),
+            ExpDesc::IndexInt(t, key) => ByteCode::SetInt(t as u8, key, value as u8),
+            ExpDesc::IndexUpField(t, key) => ByteCode::SetUpField(t as u8, key as u8, value as u8),
+            _ => panic!("assign from stack"),
+        };
+        self.fp.byte_codes.push(code);
+    }
+
+    fn assign_from_const(&mut self,var:ExpDesc,value:usize){
+        let code = match var {
+            ExpDesc::UpValue(i) => ByteCode::SetUpValueConst(i as u8,value as u8),
+            ExpDesc::Index(t, key) => ByteCode::SetTableConst(t as u8, key as u8, value as u8),
+            ExpDesc::IndexField(t, key) => ByteCode::SetFieldConst(t as u8, key as u8, value as u8),
+            ExpDesc::IndexInt(t, key) => ByteCode::SetIntConst(t as u8, key, value as u8),
+            ExpDesc::IndexUpField(t, key) => ByteCode::SetUpFieldConst(t as u8, key as u8, value as u8),
+            _ => panic!("assign from const"),
+        };
+        self.fp.byte_codes.push(code);
+    }
+
+    // add the value to constants
+    fn add_const(&mut self,c:impl Into<Value>) -> usize{
+        let c = c.into();
+        let constants = &mut self.fp.constants;
+        constants.iter().position(|v|v.same(&c)).unwrap_or_else(||{
+            constants.push(c);
+            constants.len() - 1
+        })
+    }
+
+    fn explist(&mut self) -> (usize,ExpDesc){
+        let sp0 = self.sp;
+        let mut n = 0;
+        loop {
+            let desc = self.exp();
+            if self.ctx.lex.peek() != &Token::Comma{
+                self.sp = sp0 + n;
+                return (n,desc);
+            }
+            self.ctx.lex.next();
+
+            self.discharge(sp0 + n,desc);
+            n += 1;
+        }
+    }
+
+    fn explist_want(&mut self,want:usize){
+        let (nexp,last_exp) = self.explist();
+        match (nexp + 1).cmp(&want) {
+            Ordering::Equal => {
+                self.discharge(self.sp,last_exp);
+            }
+            Ordering::Less => {
+                // expand last expressions
+                self.discharge_expand_want(last_exp,want - nexp);
+            }
+            Ordering::Greater => {
+                self.sp -= nexp - want
+            }
+        }
+    }
+
 
     fn local_new(&mut self, name: String) {
         self.ctx.levels.last_mut().unwrap().locals.push((name, false));
