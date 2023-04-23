@@ -76,10 +76,10 @@ pub enum Token {
     Dots,
 
     // constant values
-    ToInteger(i64),
-    ToFloat(f64),
+    Integer(i64),
+    Float(f64),
 
-    ToString(String),
+    String(String),
 
     Name(String),
 

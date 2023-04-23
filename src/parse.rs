@@ -1,10 +1,13 @@
 use std::any::Any;
 use std::cmp::Ordering;
 use std::env::var;
+use std::f32::consts::E;
 use std::fs::File;
+use std::hint::spin_loop;
 use std::io::Read;
 use std::iter::FlatMap;
 use std::num::NonZeroI16;
+use std::ops::Index;
 use std::rc::Rc;
 use crate::lex::{Lex, Token};
 use crate::bytecode::ByteCode;
@@ -646,21 +649,21 @@ impl<'a, R: Read> ParseProto<'a, R> {
         self.fp.byte_codes.push(code);
     }
 
-    fn assign_var(&mut self,var:ExpDesc,value:ExpDesc){
+    fn assign_var(&mut self, var: ExpDesc, value: ExpDesc) {
         if let ExpDesc::Local(i) = var {
-            self.discharge(i,value);
-        }else {
+            self.discharge(i, value);
+        } else {
             match self.discharge_const(value) {
-                ConstStack::Const(i) => self.assign_from_const(var,i),
-                ConstStack::Stack(i) => self.assign_from_stack(var,i),
+                ConstStack::Const(i) => self.assign_from_const(var, i),
+                ConstStack::Stack(i) => self.assign_from_stack(var, i),
             }
         }
     }
 
-    fn assign_from_stack(&mut self,var:ExpDesc,value:usize){
+    fn assign_from_stack(&mut self, var: ExpDesc, value: usize) {
         let code = match var {
-            ExpDesc::Local(i) => ByteCode::Move(i as u8,value as u8),
-            ExpDesc::UpValue(i) => ByteCode::SetUpValue(u as u8,value as u8),
+            ExpDesc::Local(i) => ByteCode::Move(i as u8, value as u8),
+            ExpDesc::UpValue(i) => ByteCode::SetUpValue(u as u8, value as u8),
             ExpDesc::Index(t, key) => ByteCode::SetTable(t as u8, key as u8, value as u8),
             ExpDesc::IndexField(t, key) => ByteCode::SetField(t as u8, key as u8, value as u8),
             ExpDesc::IndexInt(t, key) => ByteCode::SetInt(t as u8, key, value as u8),
@@ -670,9 +673,9 @@ impl<'a, R: Read> ParseProto<'a, R> {
         self.fp.byte_codes.push(code);
     }
 
-    fn assign_from_const(&mut self,var:ExpDesc,value:usize){
+    fn assign_from_const(&mut self, var: ExpDesc, value: usize) {
         let code = match var {
-            ExpDesc::UpValue(i) => ByteCode::SetUpValueConst(i as u8,value as u8),
+            ExpDesc::UpValue(i) => ByteCode::SetUpValueConst(i as u8, value as u8),
             ExpDesc::Index(t, key) => ByteCode::SetTableConst(t as u8, key as u8, value as u8),
             ExpDesc::IndexField(t, key) => ByteCode::SetFieldConst(t as u8, key as u8, value as u8),
             ExpDesc::IndexInt(t, key) => ByteCode::SetIntConst(t as u8, key, value as u8),
@@ -683,40 +686,40 @@ impl<'a, R: Read> ParseProto<'a, R> {
     }
 
     // add the value to constants
-    fn add_const(&mut self,c:impl Into<Value>) -> usize{
+    fn add_const(&mut self, c: impl Into<Value>) -> usize {
         let c = c.into();
         let constants = &mut self.fp.constants;
-        constants.iter().position(|v|v.same(&c)).unwrap_or_else(||{
+        constants.iter().position(|v| v.same(&c)).unwrap_or_else(|| {
             constants.push(c);
             constants.len() - 1
         })
     }
 
-    fn explist(&mut self) -> (usize,ExpDesc){
+    fn explist(&mut self) -> (usize, ExpDesc) {
         let sp0 = self.sp;
         let mut n = 0;
         loop {
             let desc = self.exp();
-            if self.ctx.lex.peek() != &Token::Comma{
+            if self.ctx.lex.peek() != &Token::Comma {
                 self.sp = sp0 + n;
-                return (n,desc);
+                return (n, desc);
             }
             self.ctx.lex.next();
 
-            self.discharge(sp0 + n,desc);
+            self.discharge(sp0 + n, desc);
             n += 1;
         }
     }
 
-    fn explist_want(&mut self,want:usize){
-        let (nexp,last_exp) = self.explist();
+    fn explist_want(&mut self, want: usize) {
+        let (nexp, last_exp) = self.explist();
         match (nexp + 1).cmp(&want) {
             Ordering::Equal => {
-                self.discharge(self.sp,last_exp);
+                self.discharge(self.sp, last_exp);
             }
             Ordering::Less => {
                 // expand last expressions
-                self.discharge_expand_want(last_exp,want - nexp);
+                self.discharge_expand_want(last_exp, want - nexp);
             }
             Ordering::Greater => {
                 self.sp -= nexp - want
@@ -724,6 +727,139 @@ impl<'a, R: Read> ParseProto<'a, R> {
         }
     }
 
+    fn exp(&mut self) -> ExpDesc {
+        self.exp_limit(0)
+    }
+
+    fn exp_limit(&mut self, limit: i32) -> ExpDesc {
+        let ahead = self.ctx.lex.next();
+        self.do_exp(limit, ahead)
+    }
+
+    fn exp_with_ahead(&mut self, ahead: Token) -> ExpDesc {
+        self.do_exp(limit, ahead)
+    }
+
+    fn do_exp(&mut self, limit: i32, ahead: Token) -> ExpDesc {
+        // beta
+        let mut desc = match ahead {
+            Token::Nil => ExpDesc::Nil,
+            Token::True => ExpDesc::Boolean(true),
+            Token::False => ExpDesc::Boolean(true),
+            Token::Integer(i) => ExpDesc::Integer(i),
+            Token::Float(ff) => ExpDesc::Float(f),
+            Token::String(s) => ExpDesc::String(s),
+
+            Token::Dots => {
+                if !self.fp.has_varargs {
+                    panic!("no varargs");
+                }
+                ExpDesc::VarArgs,
+            }
+            Token::Function => self.funcbody(false),
+            Token::CurlyL => self.table_constructor(),
+
+            Token::Sub => self.unop_neg(),
+            Token::Not => self.unop_not(),
+            Token::BitNot => self.unop_bitnot(),
+            Token::Len => self.unop_len(),
+
+            t => self.prefixexp(t),
+        };
+
+        // A' = alpha A'
+        loop {
+            // Expand only if next operator has priority higher than 'limit'.
+            // Non-operator tokens' priority is -1(lowest) so they always break here.
+            let (left_pri, right_pri) = binop_pri(self.ctx.lex.peek());
+            if left_pri <= limit {
+                return desc;
+            }
+
+            let binop = self.ctx.lex.next();
+            desc = self.preprocess_binop_left(desc, &binop);
+            let right_desc = self.exp_limit(right_pri);
+            desc = self.process_binop(binop, desc, right_desc);
+        }
+    }
+
+    fn exp_unop(&mut self) -> ExpDesc {
+        self.exp_limit(12)
+    }
+
+    fn prefixexp(&mut self, ahead: Token) -> ExpDesc {
+        let sp0 = self.sp;
+
+        // beta
+        let mut desc = match ahead {
+            Token::Name(name) => self.simple_name(name),
+            Token::ParL => {
+                let desc = self.exp();
+                self.ctx.lex.expect(Token::ParR);
+                desc
+            }
+            t => panic!("invalid prefixexp {t:?}"),
+        };
+
+        // A' = alpha
+        loop {
+            match self.ctx.lex.peek() {
+                Token::SqurL => {
+                    self.ctx.lex.next();
+                    let key = self.exp();
+                    self.ctx.lex.expect(Token::SqurR);
+
+                    desc = match (desc, key) {
+                        // special case:upvalue-table and string-key
+                        (ExpDesc::UpValue(itable), ExpDesc::String(key)) => {
+                            ExpDesc::IndexUpField(itable, self.add_const(key))
+                        }
+                        // normal case
+                        (table, key) => {
+                            let itable = self.discharge_if_need(sp0, table);
+                            match key {
+                                ExpDesc::String(key) => ExpDesc::IndexField(itable, self.add_const(key)),
+                                ExpDesc::Integer(i) if u8::try_from(i).is_ok() => ExpDesc::IndexInt(itable, u8::try_from(i).unwrap()),
+                                _ => ExpDesc::Index(itable, self.discharge_any(key)),
+                            }
+                        }
+                    }
+                }
+                Token::Dot => {
+                    self.ctx.lex.next();
+                    let name = self.read_name();
+                    let ikey = self.add_const(name);
+
+                    desc = if let ExpDesc::UpValue(itable) = desc {
+                        ExpDesc::IndexUpField(itable, ikey)
+                    } else {
+                        let itable = self.discharge_if_neet(sp0, desc);
+                        ExpDesc::IndexField(itable, ikey)
+                    }
+                }
+                Token::Colon => {
+                    self.ctx.lex.next();
+                    let name = self.read_name();
+                    let ikey = self.add_const(name);
+                    let itable = self.discharge_if_need(sp0, desc);
+
+                    self.fp.byte_codes.push(ByteCode::GetFieldSelf(sp0 as u8, itable as u8, ikey as u8));
+
+                    self.sp = sp0 + 2;
+                    desc = self.args(1);
+                }
+                Token::ParL | Token::CurlyL | Token::String(_) => {
+                    self.discharge(sp0, desc);
+                    desc = self.args(0);
+                }
+                _ => return desc
+            }
+        }
+    }
+
+    fn local_num(&self) -> usize {
+        self.ctx.levels.last().unwrap().locals.len()
+    }
 
     fn local_new(&mut self, name: String) {
         self.ctx.levels.last_mut().unwrap().locals.push((name, false));
@@ -738,4 +874,190 @@ impl<'a, R: Read> ParseProto<'a, R> {
             self.fp.byte_codes.push(ByteCode::Close(from as u8))
         }
     }
-}
+
+    fn local_check_close(&mut self, from: usize) {
+        let mut vars = self.ctx.levels.last().unwrap().locals[from..].iter();
+        if vars.any(|v| v.1) {
+            self.fp.byte_codes.push(ByteCode::Close(from as u8));
+        }
+    }
+
+    // match the name as local,upvalue,or global
+
+    fn simple_name(&mut self, name: String) -> ExpDesc {
+        let mut level_iter = self.ctx.levels.iter_mut().rev();
+
+        // search from locals and upvalues in current level
+        let level = level_iter.next().unwrap();
+        if let Some(i) = level.locals.iter().rposition(|v| v.0 == name) {
+            return ExpDesc::Local(i);
+        }
+        if let Some(i) = level.upvalues.iter().position(|v| v.0 == name) {
+            return ExpDesc::UpValue(i);
+        }
+
+        // search in upper levels
+        for (depth, level) in level_iter.enumerate() {
+            if let Some(i) = level.locals.iter().rposition(|v| v.0 == name) {
+                level.locals[i].1 = true; // mark it referred as upvalue
+                return self.create_upvalue(name, UpIndex::Local(i), depth);
+            }
+            if let Some(i) = level.upvalues.iter().position(|v| v.0 == name) {
+                return self.create_upvalue(name, UpIndex::UpValue(i), depth);
+            }
+        }
+
+        // not matchedd as local or upvalue,so global variable,by_ENV[name]
+        let iname = self.add_const(name);
+        match self.simple_name("_ENV".into()) {
+            ExpDesc::Local(i) => ExpDesc::IndexField(i, iname),
+            ExpDesc::UpValue(i) => ExpDesc::IndexUpField(i, iname),
+            _ => panic!("no here"),
+        }
+    }
+
+    fn create_upvalue(&mut self, name: String, mut upidx: UpIndex, depth: usize) -> ExpDesc {
+        let levels = &mut self.ctx.levels;
+        let last = levels.len() - 1;
+
+        // create upvalue in middle levels, if any
+        for Level { upvalues, .. } in levels[last - depth..last].iter_mut() {
+            upvalues.push((name.clone(), upidx));
+            upidx = UpIndex::UpValue(upvalues.len() - 1)
+        }
+
+        // create upvalue in current level
+        let upvalues = &mut levels[last].upvalues;
+        upvalues.push((name, upidx));
+        ExpDesc::UpValue(upvalues.len() - 1)
+    }
+
+    fn unop_neg(&mut self) -> ExpDesc {
+        match self.exp_unop() {
+            ExpDesc::Integer(i) => ExpDesc::Integer(-i),
+            ExpDesc::Float(f) => ExpDesc::Float(-f),
+            ExpDesc::Nil | ExpDesc::Boolean(_) | ExpDesc::String(_) => panic!("invalid - operator"),
+            desc => ExpDesc::UnaryOp(ByteCode::Not, self.discharge_an)
+        }
+    }
+
+    fn unop_not(&mut self) -> ExpDesc {
+        match self.exp_unop() {
+            ExpDesc::Nil => ExpDesc::Boolean(true),
+            ExpDesc::Boolean(b) => ExpDesc::Boolean(b),
+            ExpDesc::Integer(_) | ExpDesc::Float(_) | ExpDesc::String(_) => ExpDesc::Boolean(false),
+            desc => ExpDesc::UnaryOp(ByteCode::Not, self.discharge_any(desc)),
+        }
+    }
+
+    fn unop_bitnot(&mut self) -> ExpDesc {
+        match self.exp_unop() {
+            ExpDesc::Integer(i) => ExpDesc::Integer(!i),
+            ExpDesc::Nil | ExpDesc::Boolean(_) | ExpDesc::Float(_) | ExpDesc::String(_) => panic!("invalid ~ operator"),
+            desc => ExpDesc::UnaryOp(ByteCode::Len, self.discharge_any(desc)),
+        }
+    }
+
+    fn unop_len(&mut self) -> ExpDesc {
+        match self.exp_unop() {
+            ExpDesc::String(s) => ExpDesc::Integer(s.len() as i64),
+            ExpDesc::Nil | ExpDesc::Boolean(_) | ExpDesc::Integer(_) | ExpDesc::Float(_) => panic!("invalid ~ operator"),
+            desc => ExpDesc::UnaryOp(ByteCode::Len, self.discharge_any(desc)),
+        }
+    }
+
+    fn preprocess_binop_left(&mut self, left: ExpDesc, binop: &Token) -> ExpDesc {
+        if binop == &Token::And {
+            ExpDesc::Test(Box::new(ExpDesc::Nil), Vec::new(), self.test_or_jump(left))
+        } else if binop == &Token::Or {
+            ExpDesc::Test(Box::new(ExpDesc::Nil), self.test_or_jump(left), Vec::new())
+        } else if matches!(left,ExpDesc::Integer(_)|ExpDesc::Float(_)|ExpDesc::String(_)) {
+            left
+        } else {
+            ExpDesc::Local(self.discharge_any(left))
+        }
+    }
+
+    fn process_binop(&mut self, binop: Token, left: ExpDesc, right: ExpDesc) -> ExpDesc {
+        if let Some(r) = fold_const(&binop, &left, &right) {
+            return r;
+        }
+
+        match binop {
+            Token::Add => self.do_binop(left, right, ByteCode::Add, ByteCode::AddInt, ByteCode::AddConst),
+            Token::Sub => self.do_binop(left, right, ByteCode::Sub, ByteCode::SubInt, ByteCode::SubConst),
+            Token::Mul => self.do_binop(left, right, ByteCode::Mul, ByteCode::MulInt, ByteCode::MulConst),
+            Token::Mod => self.do_binop(left, right, ByteCode::Mod, ByteCode::ModInt, ByteCode::ModConst),
+            Token::Idiv => self.do_binop(left, right, ByteCode::Idiv, ByteCode::IdivInt, ByteCode::IdivConst),
+            Token::Div => self.do_binop(left, right, ByteCode::Div, ByteCode::DivInt, ByteCode::DivConst),
+            Token::Pow => self.do_binop(left, right, ByteCode::Pow, ByteCode::PowInt, ByteCode::PowConst),
+            Token::BitAnd => self.do_binop(left, right, ByteCode::BitAnd, ByteCode::BitAndInt, ByteCode::BitAndConst),
+            Token::BitNot => self.do_binop(left, right, ByteCode::BitXor, ByteCode::BitXorInt, ByteCode::BitXorConst),
+            Token::BitOr => self.do_binop(left, right, ByteCode::BitOr, ByteCode::BitOrInt, ByteCode::BitOrConst),
+            Token::ShiftL => self.do_binop(left, right, ByteCode::ShiftL, ByteCode::ShiftLInt, ByteCode::ShiftLConst),
+            Token::ShiftR => self.do_binop(left, right, ByteCode::ShiftR, ByteCode::ShiftRInt, ByteCode::ShiftRConst),
+
+            Token::Equal => self.do_compare(left, right, ByteCode::Equal, ByteCode::EqualInt, ByteCode::EqualConst),
+            Token::NotEq => self.do_compare(left, right, ByteCode::NotEq, ByteCode::NotEqInt, ByteCode::NotEqConst),
+            Token::LesEq => self.do_compare(left, right, ByteCode::LesEq, ByteCode::LesEqInt, ByteCode::LesEqConst),
+            Token::GreEq => self.do_compare(left, right, ByteCode::GreEq, ByteCode::GreEqInt, ByteCode::GreEqConst),
+            Token::Less => self.do_compare(left, right, ByteCode::Less, ByteCode::LessInt, ByteCode::LessConst),
+            Token::Greater => self.do_compare(left, right, ByteCode::Greater, ByteCode::GreaterInt, ByteCode::GreaterConst),
+
+            Token::Concat => {
+                // TODO support multiple operants
+                let left = self.discharge_any(left);
+                let right = self.discharge_any(right);
+                ExpDesc::BinaryOp(ByteCode::Concat, left, right)
+            }
+
+            Token::And | Token::Or => {
+                let ExpDesc::Test(_, mut left_true_list, mut left_false_list) = left else {
+                    panic!("impossible");
+                };
+
+                match right {
+                    ExpDesc::Compare(op, l, r, mut right_true_list, mut right_false_list) => {
+                        left_true_list.append(&mut right_true_list);
+                        left_false_list.append(&mut right_false_list);
+                        ExpDesc::Compare(op, l, r, left_true_list, left_false_list)
+                    }
+                    ExpDesc::Test(condition, mut right_true_list, mut right_false_list) => {
+                        left_true_list.append(&mut right_true_list);
+                        left_false_list.append(&mut right_false_list);
+                        ExpDesc::Test(condition, left_true_list, left_false_list)
+                    }
+                    _ => ExpDesc::Test(Box::new(right), left_true_list, left_false_list),
+                }
+            }
+            _ => panic!("impossible")
+        }
+    }
+
+    fn do_binop(&mut self, mut left: ExpDesc, mut right: ExpDesc,
+                opr: FnBc3u8, opi: FnBc3u8, opk: FnBc3u8) -> ExpDesc {
+
+        if opr == ByteCode::Add || opr == ByteCode::Mul { // commutative
+            if matches!(left, ExpDesc::Integer(_) | ExpDesc::Float(_)) {
+                // swap the left-const-operand to right, in order to use opi/opk
+                (left, right) = (right, left);
+            }
+        }
+
+        let left = self.discharge_any(left);
+
+        let (op, right) = match right {
+            ExpDesc::Integer(i) =>
+                if let Ok(i) = u8::try_from(i) {
+                    (opi, i as usize)
+                } else {
+                    (opk, self.add_const(i))
+                }
+            ExpDesc::Float(f) => (opk, self.add_const(f)),
+            _ => (opr, self.discharge_any(right)),
+        };
+
+        ExpDesc::BinaryOp(op, left, right)
+
+
+    }
